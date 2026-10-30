@@ -1,4 +1,5 @@
 import Clutter from 'gi://Clutter';
+import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 import Gio from 'gi://Gio';
 import St from 'gi://St';
@@ -17,12 +18,27 @@ import { ButtonMask } from '../misc/compatibility.js';
 import { Shortcut } from '../misc/shortcuts.js';
 import { TagsItem } from './components/tagsItem.js';
 
-function localeContains(collator: Intl.Collator, text: string, query: string): boolean {
-	for (let offset = 0; offset <= text.length - query.length; offset++) {
-		const comparison = collator.compare(text.substring(offset, offset + query.length), query);
-		if (comparison === 0) return true;
+// Combining diacritical marks (accents) stripped after NFD decomposition,
+// approximating Intl.Collator with sensitivity 'base' (case- and accent-insensitive)
+const COMBINING_MARKS = /[\u0300-\u036f]/g;
+
+function foldString(text: string): string {
+	return text.normalize('NFD').replace(COMBINING_MARKS, '').toLowerCase();
+}
+
+// Folding is O(n) per string, so cache results keyed by the original string.
+// The cache is cleared once it grows beyond a fixed bound.
+const FOLD_CACHE_MAX = 2048;
+const foldCache = new Map<string, string>();
+
+function fold(text: string): string {
+	let folded = foldCache.get(text);
+	if (folded === undefined) {
+		folded = foldString(text);
+		if (foldCache.size >= FOLD_CACHE_MAX) foldCache.clear();
+		foldCache.set(text, folded);
 	}
-	return false;
+	return folded;
 }
 
 export const SearchChange = {
@@ -33,6 +49,9 @@ export const SearchChange = {
 } as const;
 
 export type SearchChange = (typeof SearchChange)[keyof typeof SearchChange];
+
+/** Debounce interval for search updates while typing (milliseconds). */
+const SEARCH_DEBOUNCE_MS = 120;
 
 @registerClass({
 	Properties: {
@@ -46,6 +65,8 @@ export type SearchChange = (typeof SearchChange)[keyof typeof SearchChange];
 	},
 })
 export class SearchQuery extends GObject.Object {
+	private readonly _foldedQuery: string;
+
 	constructor(
 		readonly change: SearchChange,
 		readonly query: string,
@@ -54,9 +75,10 @@ export class SearchQuery extends GObject.Object {
 		readonly tag: Tag | null,
 		readonly excludeTagged: boolean,
 		readonly type: ItemType | null,
-		private readonly collator: Intl.Collator,
 	) {
 		super();
+
+		this._foldedQuery = fold(query);
 	}
 
 	public matchesPinned(pinned: boolean): boolean {
@@ -79,7 +101,8 @@ export class SearchQuery extends GObject.Object {
 		if (this.query.length === 0) return true;
 		if (text.length === 0) return false;
 
-		return text.some((s) => localeContains(this.collator, s, this.query));
+		const foldedQuery = this._foldedQuery;
+		return text.some((s) => fold(s).includes(foldedQuery));
 	}
 
 	public matchesEntry(state: boolean, entry: ClipboardEntry, ...text: string[]): boolean {
@@ -101,7 +124,6 @@ export class SearchQuery extends GObject.Object {
 			this.tag,
 			this.excludeTagged,
 			this.type,
-			this.collator,
 		);
 	}
 }
@@ -261,12 +283,11 @@ class ItemPopupMenu extends PopupMenu.PopupMenu<ItemPopupMenuSignals> {
 	},
 })
 export class SearchEntry extends St.Entry {
-	private _collator: Intl.Collator | undefined = new Intl.Collator(undefined, { sensitivity: 'base' });
-
 	private _prevSearch: SearchQuery | null = null;
 	private _pinned: boolean = false;
 	private _tag: Tag | null = null;
 	private _type: ItemType | null = null;
+	private _searchTimeoutId: number = -1;
 
 	private readonly _icons: { [type in ItemType | 'search']: Gio.Icon };
 	private readonly _itemButton: St.Button;
@@ -373,14 +394,14 @@ export class SearchEntry extends St.Entry {
 
 		this.ext.settings.connectObject(
 			'changed::exclude-pinned',
-			this.search.bind(this),
+			this.scheduleSearch.bind(this),
 			'changed::exclude-tagged',
-			this.search.bind(this),
+			this.scheduleSearch.bind(this),
 			this,
 		);
 
 		// Connect signals
-		this.connect('notify::text', this.search.bind(this));
+		this.connect('notify::text', this.scheduleSearch.bind(this));
 		this.clutter_text.connect('key-press-event', (_text, event: Clutter.Event) => this._keyPressEvent(event));
 	}
 
@@ -390,7 +411,7 @@ export class SearchEntry extends St.Entry {
 
 	set pinned(pinned: boolean) {
 		this._pinned = pinned;
-		this.search();
+		this.scheduleSearch();
 		this.notify('pinned');
 	}
 
@@ -401,7 +422,7 @@ export class SearchEntry extends St.Entry {
 	set tag(tag: Tag | null) {
 		this._tag = tag;
 		this._menu.tag = tag;
-		this.search();
+		this.scheduleSearch();
 
 		this._itemButton.style_class = 'search-entry-button item-button' + (tag ? ` ${tag}` : '');
 
@@ -415,7 +436,7 @@ export class SearchEntry extends St.Entry {
 	set type(type: ItemType | null) {
 		this._type = type;
 		this._menu.selected = type;
-		this.search();
+		this.scheduleSearch();
 		this.notify('type');
 	}
 
@@ -481,16 +502,32 @@ export class SearchEntry extends St.Entry {
 				change = change === SearchChange.Same || change === typeChange ? typeChange : SearchChange.Different;
 		}
 
-		return new SearchQuery(
-			change,
-			query,
-			this.pinned,
-			excludePinned,
-			this.tag,
-			excludeTagged,
-			this.type,
-			this._collator!,
-		);
+		return new SearchQuery(change, query, this.pinned, excludePinned, this.tag, excludeTagged, this.type);
+	}
+
+	/**
+	 * Schedules a search with a short debounce so that fast typing does not
+	 * re-run the search for every keystroke.
+	 */
+	private scheduleSearch() {
+		if (this._searchTimeoutId >= 0) return;
+
+		this._searchTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT_IDLE, SEARCH_DEBOUNCE_MS, () => {
+			this._searchTimeoutId = -1;
+			this.search();
+			return GLib.SOURCE_REMOVE;
+		});
+	}
+
+	/**
+	 * Runs a pending debounced search immediately, if any.
+	 */
+	private flushSearch() {
+		if (this._searchTimeoutId < 0) return;
+
+		GLib.source_remove(this._searchTimeoutId);
+		this._searchTimeoutId = -1;
+		this.search();
 	}
 
 	private search() {
@@ -556,6 +593,7 @@ export class SearchEntry extends St.Entry {
 
 		// Submit: Enter
 		if (key === Clutter.KEY_Return || key === Clutter.KEY_KP_Enter) {
+			this.flushSearch();
 			this.emit('activate');
 			return Clutter.EVENT_STOP;
 		}
@@ -622,9 +660,13 @@ export class SearchEntry extends St.Entry {
 	}
 
 	override destroy() {
+		if (this._searchTimeoutId >= 0) {
+			GLib.source_remove(this._searchTimeoutId);
+			this._searchTimeoutId = -1;
+		}
+
 		this.ext.settings.disconnectObject(this);
 		this._menu.destroy();
-		this._collator = undefined;
 
 		super.destroy();
 	}

@@ -20,6 +20,51 @@ import { ClipboardItem } from './clipboardItem.js';
 const SPACING = 3;
 const IMAGE_SPACING = 6;
 
+/** Maximum number of concurrent metadata/image requests. */
+const MAX_CONCURRENT_REQUESTS = 4;
+let activeRequests = 0;
+const pendingRequests: (() => void)[] = [];
+
+/**
+ * Runs an async network request in a limited concurrency slot so that
+ * rebuilding the history list does not fire dozens of simultaneous requests.
+ */
+async function withRequestSlot<T>(fn: () => Promise<T>): Promise<T> {
+	if (activeRequests >= MAX_CONCURRENT_REQUESTS) {
+		await new Promise<void>((resolve) => {
+			pendingRequests.push(resolve);
+		});
+	}
+
+	activeRequests++;
+	try {
+		return await fn();
+	} finally {
+		activeRequests--;
+		pendingRequests.shift()?.();
+	}
+}
+
+// Cache the compiled exclusion regex; compiling it per item is wasteful
+let cachedExclusionPatterns: string | null = null;
+let cachedExclusionRegex: RegExp | null = null;
+
+function getExclusionRegex(patterns: string[]): RegExp | null {
+	if (patterns.length === 0) return null;
+
+	const key = patterns.join('\n');
+	if (key !== cachedExclusionPatterns) {
+		cachedExclusionPatterns = key;
+		try {
+			cachedExclusionRegex = new RegExp(patterns.join('|'));
+		} catch {
+			cachedExclusionRegex = null;
+		}
+	}
+
+	return cachedExclusionRegex;
+}
+
 @registerClass({
 	Properties: {
 		'metadata': GObject.ParamSpec.jsobject('metadata', null, null, GObject.ParamFlags.READWRITE),
@@ -150,7 +195,7 @@ export class LinkPreview extends St.Widget {
 		} else if (this._image === undefined && this._metadata?.image && this._showImage) {
 			this._image = null;
 
-			tryGetLinkImage(this.ext, this._metadata.image, this._cancellable)
+			withRequestSlot(() => tryGetLinkImage(this.ext, this._metadata!.image!, this._cancellable))
 				.then((image) => {
 					if (image) {
 						this._image = new ImagePreview(this.ext, image);
@@ -298,6 +343,7 @@ export class LinkItem extends ClipboardItem {
 	private readonly _url: St.Label;
 
 	private readonly _cancellable: Gio.Cancellable = new Gio.Cancellable();
+	private _metadataRequested: boolean = false;
 
 	constructor(ext: CopyousExtension, entry: ClipboardEntry) {
 		super(ext, entry, Icon.Link, _('Link'));
@@ -320,7 +366,12 @@ export class LinkItem extends ClipboardItem {
 
 		this.bind_property('active', this._linkPreview, 'active', GObject.BindingFlags.DEFAULT);
 
-		this.updateLinkPreview().catch(() => {});
+		this.updateLinkPreview();
+	}
+
+	override vfunc_map(): void {
+		super.vfunc_map();
+		this.requestMetadata().catch(() => {});
 	}
 
 	public override search(query: SearchQuery): void {
@@ -331,17 +382,8 @@ export class LinkItem extends ClipboardItem {
 		this.visible = query.matchesEntry(this.visible, this.entry, ...searchTexts);
 	}
 
-	private async updateLinkPreview() {
-		const patterns = this.linkItemSettings.get_strv('link-preview-exclusion-patterns');
-
-		let regex = null;
-		if (patterns.length > 0) {
-			try {
-				regex = new RegExp(patterns.join('|'));
-			} catch {
-				// Ignore
-			}
-		}
+	private updateLinkPreview() {
+		const regex = getExclusionRegex(this.linkItemSettings.get_strv('link-preview-exclusion-patterns'));
 
 		const url = this.entry.content.trim();
 		const showLinkPreview = this.linkItemSettings.get_boolean('show-link-preview');
@@ -361,10 +403,30 @@ export class LinkItem extends ClipboardItem {
 		if (this.entry.metadata) {
 			const metadata: LinkMetadata = { title: null, description: null, image: null, ...this.entry.metadata };
 			this._linkPreview.metadata ??= metadata;
-		} else if (show) {
-			const metadata = await tryGetMetadata(this.ext, url, this._cancellable);
+		} else {
+			// Fetch missing metadata once the item is visible
+			this.requestMetadata().catch(() => {});
+		}
+	}
+
+	/**
+	 * Fetches link metadata over the network. Requests are deferred until the
+	 * item is mapped and share a small concurrency pool, so creating the
+	 * history list does not fire a burst of network requests.
+	 */
+	private async requestMetadata(): Promise<void> {
+		if (this._metadataRequested || !this.mapped || this.entry.metadata || !this._linkPreview.visible) return;
+		this._metadataRequested = true;
+
+		const url = this.entry.content.trim();
+		try {
+			const metadata = await withRequestSlot(() => tryGetMetadata(this.ext, url, this._cancellable));
+			if (this._cancellable.is_cancelled()) return;
+
 			this.entry.metadata = metadata;
 			this._linkPreview.metadata = metadata;
+		} catch {
+			// Ignore
 		}
 	}
 

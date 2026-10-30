@@ -86,6 +86,20 @@ export class ClipboardScrollView extends St.ScrollView {
 		this._scrollContainer.clearItems();
 	}
 
+	/**
+	 * Unmounts all but the first few items so opening the dialog is fast.
+	 */
+	public resetToInitialMount() {
+		this._scrollContainer.resetToInitialMount();
+	}
+
+	/**
+	 * Schedules mounting the remaining items in idle chunks.
+	 */
+	public scheduleMountAll() {
+		this._scrollContainer.scheduleMountAll();
+	}
+
 	public selectItem(index: number): boolean {
 		return this._scrollContainer.selectItem(index);
 	}
@@ -187,6 +201,12 @@ export class ClipboardScrollView extends St.ScrollView {
 		} else {
 			adjustment = this.vadjustment;
 			step = this._itemHeight + spacing;
+		}
+
+		// Mount more items when scrolling towards the end of the mounted range
+		// while the idle fill-in of the list has not completed yet
+		if (delta > 0 && adjustment.value + adjustment.page_size > adjustment.upper - adjustment.page_size) {
+			this._scrollContainer.mountAhead();
 		}
 
 		// Extend previous animation or current value

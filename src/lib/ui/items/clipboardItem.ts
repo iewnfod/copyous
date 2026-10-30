@@ -32,6 +32,7 @@ export class ClipboardItem extends St.Button {
 	private _protectPinned: boolean = true;
 	private _protectTagged: boolean = true;
 	private _middleClickAction: MiddleClickAction = MiddleClickAction.None;
+	private _settingsDirty: boolean = false;
 
 	private readonly _box: St.Widget;
 	private readonly _header: ClipboardItemHeader;
@@ -71,9 +72,16 @@ export class ClipboardItem extends St.Button {
 			x_expand: true,
 			y_expand: true,
 			clip_to_allocation: true,
-			effect: new HoleEffect(this._header.buttons),
 		});
 		this._box.add_child(this._content);
+
+		// The hole effect forces an offscreen render of the content for every
+		// paint, which is far too expensive to keep enabled on hundreds of
+		// items. Enable it only while header controls are actually visible.
+		const holeEffect = new HoleEffect(this._header.buttons);
+		holeEffect.enabled = false;
+		this._content.add_effect(holeEffect);
+		this._header.bind_property('controls-visible', holeEffect, 'enabled', GObject.BindingFlags.SYNC_CREATE);
 
 		// Bind properties
 		entry.bind_property(
@@ -93,16 +101,16 @@ export class ClipboardItem extends St.Button {
 
 		// prettier-ignore
 		this.ext.settings.connectObject(
-			'changed::item-width', this.updateSize.bind(this),
-			'changed::item-height', this.updateSize.bind(this),
-			'changed::dynamic-item-height', this.updateSize.bind(this),
-			'changed::clipboard-orientation', this.updateSize.bind(this),
-			'changed::protect-pinned', this.updateProtection.bind(this),
-			'changed::protect-tagged', this.updateProtection.bind(this),
-			'changed::middle-click-action', this.updateMiddleClickAction.bind(this),
-			'changed::show-header', this.updateHeader.bind(this),
-			'changed::show-item-title', this.updateHeader.bind(this),
-			'changed::header-controls-visibility', this.updateHeader.bind(this),
+			'changed::item-width', () => this.onSettingsChanged(() => this.updateSize()),
+			'changed::item-height', () => this.onSettingsChanged(() => this.updateSize()),
+			'changed::dynamic-item-height', () => this.onSettingsChanged(() => this.updateSize()),
+			'changed::clipboard-orientation', () => this.onSettingsChanged(() => this.updateSize()),
+			'changed::protect-pinned', () => this.onSettingsChanged(() => this.updateProtection()),
+			'changed::protect-tagged', () => this.onSettingsChanged(() => this.updateProtection()),
+			'changed::middle-click-action', () => this.onSettingsChanged(() => this.updateMiddleClickAction()),
+			'changed::show-header', () => this.onSettingsChanged(() => this.updateHeader()),
+			'changed::show-item-title', () => this.onSettingsChanged(() => this.updateHeader()),
+			'changed::header-controls-visibility', () => this.onSettingsChanged(() => this.updateHeader()),
 			this);
 
 		this.bind_property('active', this._header, 'active', GObject.BindingFlags.SYNC_CREATE);
@@ -134,6 +142,31 @@ export class ClipboardItem extends St.Button {
 		return (focus | hover | active) as ActiveState;
 	}
 
+	/**
+	 * Applies a settings update immediately when the item is visible, or
+	 * defers it until the item is mapped. This keeps a settings change from
+	 * re-styling hundreds of offscreen items at once.
+	 */
+	private onSettingsChanged(update: () => void): void {
+		if (this.mapped) {
+			update();
+		} else {
+			this._settingsDirty = true;
+		}
+	}
+
+	override vfunc_map(): void {
+		super.vfunc_map();
+
+		if (this._settingsDirty) {
+			this._settingsDirty = false;
+			this.updateSize();
+			this.updateProtection();
+			this.updateMiddleClickAction();
+			this.updateHeader();
+		}
+	}
+
 	public search(query: SearchQuery) {
 		this.visible = query.matchesEntry(this.visible, this.entry, this.entry.content);
 	}
@@ -147,10 +180,15 @@ export class ClipboardItem extends St.Button {
 		const orientation: Clutter.Orientation = this.ext.settings.get_enum('clipboard-orientation');
 		if (dynamicHeight && orientation === Clutter.Orientation.VERTICAL) {
 			this.set_height(-1);
-			this.style = `max-height: ${height}px`;
+			this.updateStyle(`max-height: ${height}px`);
 		} else {
-			this.style = '';
+			this.updateStyle('');
 		}
+	}
+
+	private updateStyle(style: string) {
+		// Avoid re-parsing the style when it did not change
+		if (this.style !== style) this.style = style;
 	}
 
 	private updateProtection() {

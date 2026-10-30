@@ -208,6 +208,13 @@ export interface CodeLabelConstructorProps {
 }
 
 /**
+ * Maximum input length passed to highlight.js. highlightAuto tries every
+ * registered language, which is extremely slow on large snippets, and the
+ * label is ellipsized anyway.
+ */
+const HIGHLIGHT_MAX_LENGTH = 8192;
+
+/**
  * Applies a theme to highlight.js output
  * @param colorScheme the color scheme
  * @param highlighted the highlighted highlight.js output
@@ -263,6 +270,7 @@ export class CodeLabel extends St.Label {
 	private _showLineNumbers = true;
 
 	private _highlighted: string = '';
+	private _needsUpdate: boolean = false;
 
 	public constructor(
 		private ext: CopyousExtension,
@@ -286,14 +294,14 @@ export class CodeLabel extends St.Label {
 		if (this.ext.themeManager) {
 			this._colorSchemeChangedId = this.ext.themeManager?.connect(
 				'notify::color-scheme',
-				this.updateText.bind(this),
+				this.scheduleUpdate.bind(this),
 			);
 		}
 
 		// Update text after hljs is loaded
-		this.ext.connectHljsInit(this.updateText.bind(this));
+		this.ext.connectHljsInit(this.scheduleUpdate.bind(this));
 
-		this.updateText();
+		this.scheduleUpdate();
 	}
 
 	override destroy(): void {
@@ -311,7 +319,7 @@ export class CodeLabel extends St.Label {
 	set code(code: string) {
 		if (this._code === code) return;
 		this._code = code;
-		this.updateText();
+		this.scheduleUpdate();
 		this.notify('code');
 	}
 
@@ -322,7 +330,7 @@ export class CodeLabel extends St.Label {
 	set language(language: Language | null) {
 		if (this._language === language) return;
 		this._language = language;
-		this.updateText();
+		this.scheduleUpdate();
 		this.notify('language');
 	}
 
@@ -333,7 +341,7 @@ export class CodeLabel extends St.Label {
 	set syntaxHighlighting(syntaxHighlighting: boolean) {
 		if (this._syntaxHighlighting === syntaxHighlighting) return;
 		this._syntaxHighlighting = syntaxHighlighting;
-		this.updateText();
+		this.scheduleUpdate();
 		this.notify('syntax-highlighting');
 	}
 
@@ -355,20 +363,49 @@ export class CodeLabel extends St.Label {
 	set tabWidth(tabWidth: number) {
 		if (this._tabWidth === tabWidth) return;
 		this._tabWidth = tabWidth;
-		this.updateText();
+		this.scheduleUpdate();
 		this.notify('tab-width');
 	}
 
-	private updateText() {
+	/**
+	 * Updates the text immediately when visible, or marks it for a deferred
+	 * update (cheap plain-text rendering only) until the label is mapped.
+	 *
+	 * Highlighting is expensive (highlightAuto tries every language), so it
+	 * must not run for the hundreds of offscreen labels of the history list.
+	 */
+	private scheduleUpdate(): void {
+		if (this.mapped) {
+			this._needsUpdate = false;
+			this.updateText();
+		} else {
+			this._needsUpdate = true;
+			this.updateText(false);
+		}
+	}
+
+	override vfunc_map(): void {
+		super.vfunc_map();
+
+		if (this._needsUpdate) {
+			this._needsUpdate = false;
+			this.updateText();
+		}
+	}
+
+	private updateText(highlight: boolean = true) {
 		if (this._code == null) return;
 
 		// Trim indentation before highlighting to prevent empty lines
 		let text = normalizeIndentation(trim(this._code), this.tabWidth);
-		if (this.syntaxHighlighting && this.ext.hljs != null) {
+		if (highlight && this.syntaxHighlighting && this.ext.hljs != null) {
 			const language =
 				this.language && this.ext.hljs.getLanguage(this.language.id) != null ? this.language.id : null;
+			const highlightText = text.length > HIGHLIGHT_MAX_LENGTH ? text.substring(0, HIGHLIGHT_MAX_LENGTH) : text;
 
-			const result = language ? this.ext.hljs.highlight(text, { language }) : this.ext.hljs.highlightAuto(text);
+			const result = language
+				? this.ext.hljs.highlight(highlightText, { language })
+				: this.ext.hljs.highlightAuto(highlightText);
 			text = applyTheme(this.ext.themeManager?.colorScheme, result.value);
 
 			// Store language

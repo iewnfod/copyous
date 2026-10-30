@@ -72,6 +72,13 @@ class TimeLabel extends St.Label {
 		'active': flagsParamSpec('active', GObject.ParamFlags.READWRITE, ActiveState, ActiveState.None),
 		'custom-title': GObject.ParamSpec.string('custom-title', null, null, GObject.ParamFlags.READWRITE, ''),
 		'default-title': GObject.ParamSpec.string('default-title', null, null, GObject.ParamFlags.READWRITE, ''),
+		'controls-visible': GObject.ParamSpec.boolean(
+			'controls-visible',
+			null,
+			null,
+			GObject.ParamFlags.READABLE,
+			false,
+		),
 	},
 	Signals: {
 		'delete': {},
@@ -92,6 +99,7 @@ export class ClipboardItemHeader extends St.BoxLayout {
 	private _customTitle: string = '';
 	private _defaultTitle: string = '';
 	private _isEditing: boolean = false;
+	private _controlsVisible: boolean = false;
 
 	private readonly _headerIcon: St.Icon;
 	private readonly _headerContent: St.BoxLayout;
@@ -355,6 +363,10 @@ export class ClipboardItemHeader extends St.BoxLayout {
 		this.notify('default-title');
 	}
 
+	get controlsVisible() {
+		return this._controlsVisible;
+	}
+
 	public startEditing() {
 		if (this._isEditing) return;
 		this._isEditing = true;
@@ -451,5 +463,13 @@ export class ClipboardItemHeader extends St.BoxLayout {
 		this._menuButton.visible = visible;
 		this._deleteButton.visible = visible && deleteVisible;
 		this._tagIcon.visible = this._tag !== null && !this._pinButton.visible;
+
+		// Notify listeners (e.g. the hole effect) whether any control is visible
+		const controlsVisible =
+			this._pinButton.visible || this._menuButton.visible || this._deleteButton.visible || this._tagIcon.visible;
+		if (controlsVisible !== this._controlsVisible) {
+			this._controlsVisible = controlsVisible;
+			this.notify('controls-visible');
+		}
 	}
 }

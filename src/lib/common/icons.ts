@@ -49,11 +49,23 @@ export const Icon = {
 
 export type Icon = (typeof Icon)[keyof typeof Icon];
 
+// Cache resolved icons: loadIcon is called for every history item (4-5 icons
+// each) and query_exists is synchronous disk I/O, which is far too slow to
+// repeat hundreds of times when building the item list.
+const iconCache = new Map<Icon, Gio.Icon>();
+
 export function loadIcon(ext: Extension, icon: Icon): Gio.Icon {
+	const cached = iconCache.get(icon);
+	if (cached !== undefined) return cached;
+
 	const file = Gio.file_new_for_path(`${ext.path}/icons/hicolor/scalable/actions/${icon}.svg`);
+	let gicon: Gio.Icon;
 	if (file.query_exists(null)) {
-		return Gio.Icon.new_for_string(file.get_path()!);
+		gicon = Gio.Icon.new_for_string(file.get_path()!);
 	} else {
-		return Gio.Icon.new_for_string(icon);
+		gicon = Gio.Icon.new_for_string(icon);
 	}
+
+	iconCache.set(icon, gicon);
+	return gicon;
 }

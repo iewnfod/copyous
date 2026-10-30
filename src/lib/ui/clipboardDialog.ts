@@ -441,8 +441,13 @@ export class ClipboardDialog extends St.Widget {
 		this._monitorConstraint.index = global.display.get_current_monitor();
 		Main.layoutManager.emit('system-modal-opened');
 
+		// Show only a small prefix of the history immediately and fill in the
+		// rest in idle chunks, so opening stays responsive with large histories
+		this._scrollView.resetToInitialMount();
+
 		this._dialog.opacity = 0;
 		this.show();
+		this._scrollView.scheduleMountAll();
 
 		const horizontal = this._orientation === Clutter.Orientation.HORIZONTAL;
 		if (horizontal && this._dialog.y_align === Clutter.ActorAlign.START) {

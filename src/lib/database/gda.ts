@@ -94,6 +94,65 @@ function unescape_sql(connection: Gda5.Connection, builder: Gda5.SqlBuilder | Sq
 	return connection.parse_sql_string(unescapedSql)[0];
 }
 
+const POLL_INTERVAL_MS = 100;
+const MAX_POLL_ATTEMPTS = 10;
+
+/**
+ * Polls for the result of a Gda 5 async statement execution.
+ *
+ * The first check runs immediately (in an idle callback) since most statements
+ * complete right away; this avoids a fixed 100ms delay per query. If the job
+ * is not done yet, it falls back to the original interval-based polling.
+ */
+function pollAsyncResult<T>(
+	connection: Gda5.Connection,
+	jobId: number,
+	onResult: (result: unknown, lastRow: Gda5.Set | null) => { ok: true; value: T } | { ok: false; error: Error },
+	resolve: (value: T) => void,
+	reject: (reason: Error) => void,
+	cancellable: Gio.Cancellable,
+): void {
+	let attempts = 0;
+	let cancellableId = 0;
+	let sourceId = 0;
+
+	const finish = (fn: () => void) => {
+		if (cancellableId !== 0) cancellable.disconnect(cancellableId);
+		fn();
+	};
+
+	const poll = (): boolean => {
+		try {
+			const [result, lastRow] = connection.async_fetch_result(jobId);
+			if (result) {
+				const outcome = onResult(result, lastRow);
+				finish(() => (outcome.ok ? resolve(outcome.value) : reject(outcome.error)));
+				return GLib.SOURCE_REMOVE;
+			}
+
+			if (++attempts > MAX_POLL_ATTEMPTS) {
+				finish(() => reject(new Error('Timeout')));
+				return GLib.SOURCE_REMOVE;
+			}
+		} catch (error) {
+			finish(() => reject(error as Error));
+			return GLib.SOURCE_REMOVE;
+		}
+
+		return GLib.SOURCE_CONTINUE;
+	};
+
+	sourceId = GLib.idle_add(GLib.PRIORITY_HIGH, () => {
+		// Immediate first check; reschedule as interval polling if not done yet
+		if (poll() === GLib.SOURCE_CONTINUE) {
+			sourceId = GLib.timeout_add(GLib.PRIORITY_HIGH, POLL_INTERVAL_MS, poll);
+		}
+		return GLib.SOURCE_REMOVE;
+	});
+
+	cancellableId = cancellable.connect(() => GLib.source_remove(sourceId));
+}
+
 function async_statement_execute_select<T>(
 	Gda: typeof Gda5 | typeof Gda6,
 	connection: Gda5.Connection | Gda6.Connection,
@@ -111,37 +170,19 @@ function async_statement_execute_select<T>(
 				false,
 			);
 
-			let i = 0;
-			const timeoutId = GLib.timeout_add(GLib.PRIORITY_HIGH, 100, () => {
-				try {
-					const [result] = connection.async_fetch_result(id);
-					if (result) {
-						if (result instanceof Gda.DataModel) {
-							resolve(result as DataModel<T>);
-						} else {
-							reject(new Error('Statement is not a selection statement'));
-						}
-						cancellable.disconnect(cancellableId);
-						return GLib.SOURCE_REMOVE;
+			pollAsyncResult<DataModel<T>>(
+				connection,
+				id,
+				(result) => {
+					if (result instanceof Gda.DataModel) {
+						return { ok: true, value: result as DataModel<T> };
 					}
-
-					if (i >= 10) {
-						reject(new Error('Timeout'));
-						cancellable.disconnect(cancellableId);
-						return GLib.SOURCE_REMOVE;
-					}
-
-					i++;
-					cancellable.disconnect(cancellableId);
-					return GLib.SOURCE_CONTINUE;
-				} catch (error) {
-					reject(error as Error);
-					cancellable.disconnect(cancellableId);
-					return GLib.SOURCE_REMOVE;
-				}
-			});
-
-			const cancellableId = cancellable.connect(() => GLib.source_remove(timeoutId));
+					return { ok: false, error: new Error('Statement is not a selection statement') };
+				},
+				resolve,
+				reject,
+				cancellable,
+			);
 		} else {
 			// Gda 6
 			GLib.idle_add(GLib.PRIORITY_HIGH, () => {
@@ -175,38 +216,20 @@ function async_statement_execute_non_select(
 				true,
 			);
 
-			let i = 0;
-			const timeoutId = GLib.timeout_add(GLib.PRIORITY_HIGH, 100, () => {
-				try {
-					const [result, lastRow] = connection.async_fetch_result(id);
-					if (result) {
-						if (result instanceof Gda.Set) {
-							const rows = result.get_holder_value('IMPACTED_ROWS') as number | null;
-							resolve([rows ?? -2, lastRow]);
-						} else {
-							reject(new Error('Statement is a selection statement'));
-						}
-						cancellable.disconnect(cancellableId);
-						return GLib.SOURCE_REMOVE;
+			pollAsyncResult<[number, Gda5.Set | null]>(
+				connection,
+				id,
+				(result, lastRow) => {
+					if (result instanceof Gda.Set) {
+						const rows = result.get_holder_value('IMPACTED_ROWS') as number | null;
+						return { ok: true, value: [rows ?? -2, lastRow] };
 					}
-
-					if (i >= 10) {
-						reject(new Error('Timeout'));
-						cancellable.disconnect(cancellableId);
-						return GLib.SOURCE_REMOVE;
-					}
-
-					i++;
-					cancellable.disconnect(cancellableId);
-					return GLib.SOURCE_CONTINUE;
-				} catch (error) {
-					reject(error as Error);
-					cancellable.disconnect(cancellableId);
-					return GLib.SOURCE_REMOVE;
-				}
-			});
-
-			const cancellableId = cancellable.connect(() => GLib.source_remove(timeoutId));
+					return { ok: false, error: new Error('Statement is a selection statement') };
+				},
+				resolve,
+				reject,
+				cancellable,
+			);
 		} else {
 			// Gda 6
 			GLib.idle_add(GLib.PRIORITY_HIGH, () => {

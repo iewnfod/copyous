@@ -58,6 +58,8 @@ export class CharacterItem extends ClipboardItem {
 		this._chars.visible = this.characterItemSettings.get_boolean('show-unicode');
 	}
 
+	private _lastStyle: string = '';
+
 	override vfunc_allocate(box: Clutter.ActorBox) {
 		super.vfunc_allocate(box);
 		this.updateHeight();
@@ -80,7 +82,14 @@ export class CharacterItem extends ClipboardItem {
 		const charsHeight = this._chars.has_allocation() ? this._chars.allocation.get_height() : 0;
 		const height = (this._content.allocation.get_height() - charsHeight) / fontFactor;
 		const characterSize = Math.clamp(Math.floor((200 * height) / (height + 200)), 20, maxSize);
-		this._character.set_style(`font-size: ${characterSize}px;`);
+
+		// Only set the style when the size actually changed, since setting a
+		// style during allocation re-triggers a theme change and relayout
+		const style = `font-size: ${characterSize}px;`;
+		if (style !== this._lastStyle) {
+			this._lastStyle = style;
+			this._character.set_style(style);
+		}
 	}
 
 	override destroy() {

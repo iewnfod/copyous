@@ -44,6 +44,41 @@ function countLines(text: string): number {
 	return count;
 }
 
+// Creating an Intl.Segmenter is expensive; share instances and cache counts so
+// that rebuilding the history list does not re-segment every text.
+const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+const wordSegmenter = new Intl.Segmenter(undefined, { granularity: 'word' });
+
+const COUNT_CACHE_MAX = 1024;
+const charCountCache = new Map<string, number>();
+const wordCountCache = new Map<string, number>();
+
+function countGraphemes(text: string): number {
+	const cached = charCountCache.get(text);
+	if (cached !== undefined) return cached;
+
+	let count = 0;
+	for (const _segment of graphemeSegmenter.segment(text)) count++;
+
+	if (charCountCache.size >= COUNT_CACHE_MAX) charCountCache.clear();
+	charCountCache.set(text, count);
+	return count;
+}
+
+function countWords(text: string): number {
+	const cached = wordCountCache.get(text);
+	if (cached !== undefined) return cached;
+
+	let count = 0;
+	for (const segment of wordSegmenter.segment(text)) {
+		if (segment.isWordLike) count++;
+	}
+
+	if (wordCountCache.size >= COUNT_CACHE_MAX) wordCountCache.clear();
+	wordCountCache.set(text, count);
+	return count;
+}
+
 @registerClass()
 export class ContentInfo extends St.BoxLayout {
 	protected left: St.BoxLayout;
@@ -81,6 +116,7 @@ export class TextInfo extends ContentInfo {
 
 	private _text: string;
 	private _textCountMode: TextCountMode;
+	private _needsCount: boolean = true;
 
 	constructor(text: string, textCountMode: TextCountMode) {
 		super();
@@ -90,35 +126,47 @@ export class TextInfo extends ContentInfo {
 
 		this._text = text;
 		this._textCountMode = textCountMode;
-		this.updateCount();
+		// Counting is deferred until the info is visible (mapped)
+	}
+
+	override vfunc_map(): void {
+		super.vfunc_map();
+		this.updateCountIfNeeded();
 	}
 
 	set text(text: string) {
 		if (this._text === text) return;
 		this._text = text;
-		this.updateCount();
+		this.scheduleCount();
 	}
 
 	set textCountMode(countMode: TextCountMode) {
 		if (this._textCountMode === countMode) return;
 		this._textCountMode = countMode;
+		this.scheduleCount();
+	}
+
+	private scheduleCount(): void {
+		if (this.mapped) {
+			this._needsCount = false;
+			this.updateCount();
+		} else {
+			this._needsCount = true;
+		}
+	}
+
+	private updateCountIfNeeded(): void {
+		if (!this._needsCount) return;
+		this._needsCount = false;
 		this.updateCount();
 	}
 
 	private updateCount() {
 		if (this._textCountMode === TextCountMode.Characters) {
-			const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
-			let count = 0;
-			for (const _segment of segmenter.segment(this._text)) count++;
-
+			const count = countGraphemes(this._text);
 			this._countLabel.text = ngettext('%d char', '%d chars', count).format(count);
 		} else if (this._textCountMode === TextCountMode.Words) {
-			const segmenter = new Intl.Segmenter(undefined, { granularity: 'word' });
-			let count = 0;
-			for (const segment of segmenter.segment(this._text)) {
-				if (segment.isWordLike) count++;
-			}
-
+			const count = countWords(this._text);
 			this._countLabel.text = ngettext('%d word', '%d words', count).format(count);
 		} else if (this._textCountMode === TextCountMode.Lines) {
 			const count = countLines(this._text);
